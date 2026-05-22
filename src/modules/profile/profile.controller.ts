@@ -11,21 +11,17 @@ import {
   Post,
   Put,
   Res,
-  UploadedFile,
   UseGuards,
-  UseInterceptors,
 } from '@nestjs/common';
 import type { Response } from 'express';
-import { PublishProfileDto } from './dto/publish-profile.dto';
 import {
   ApiBearerAuth,
-  ApiBody,
-  ApiConsumes,
   ApiOperation,
   ApiParam,
   ApiHeader,
   ApiResponse,
   ApiTags,
+  ApiBody,
 } from '@nestjs/swagger';
 import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
 import { Public } from '../../common/decorators/public.decorator';
@@ -36,12 +32,13 @@ import { ProfileComponent } from './entities/profile-component.entity';
 import { ProfileService } from './profile.service';
 import { CreateProfileDto } from './dto/create-profile.dto';
 import { UpdateProfileDto } from './dto/update-profile.dto';
-import { FileInterceptor } from '@nestjs/platform-express';
+import { UpsertDraftDto } from './dto/upsert-draft.dto';
+import { ProfileDraftResponseDto } from './dto/profile-draft-response.dto';
 import {
-  profilePhotoFilter,
-  profilePhotoLimits,
-  profilePhotoStorage,
-} from '../../common/upload/profile-photo';
+  ProfileResponseDto,
+  DashboardProfileResponseDto,
+} from './dto/profile-response.dto';
+import { PublishProfileDto } from './dto/publish-profile.dto';
 
 @ApiTags('profiles')
 @Controller({ path: 'profiles', version: '1' })
@@ -52,12 +49,20 @@ export class ProfileController {
   @HttpCode(HttpStatus.CREATED)
   @ApiBearerAuth('JWT')
   @ApiOperation({ summary: 'Complete onboarding with profile details' })
-  @ApiResponse({ status: 201, description: 'Profile created successfully' })
+  @ApiResponse({
+    status: 201,
+    type: ProfileResponseDto,
+    description: 'Profile created successfully',
+  })
   @ApiResponse({
     status: 409,
     description: 'User already has a profile or username is taken',
   })
-  @ApiResponse({ status: 422, description: 'Invalid username format' })
+  @ApiResponse({
+    status: 422,
+    description:
+      'Username format invalid — must be 3-30 characters, lowercase letters, numbers, and hyphens only. Must not start, end, or contain consecutive hyphens.',
+  })
   async createProfile(
     @Body() createProfileDto: CreateProfileDto,
     @currentUserDecorator.CurrentUser()
@@ -66,77 +71,130 @@ export class ProfileController {
     return this.profileService.createProfile(createProfileDto, user);
   }
 
-  @Post('publish')
+  @Put('content')
   @HttpCode(HttpStatus.OK)
   @ApiBearerAuth('JWT')
   @ApiOperation({
-    summary: 'Publish or unpublish authenticated user profile',
+    summary: 'Save (upsert) a draft for the authenticated user',
+    description:
+      'Creates the draft row if none exists; updates it if one does. ' +
+      'To guard against concurrent overwrites from another browser tab, ' +
+      'send the `updatedAt` value from the last GET or PUT response as ' +
+      'the `X-Draft-Version` header. Omit the header on the very first save.',
+  })
+  @ApiHeader({
+    name: 'X-Draft-Version',
+    description:
+      'ISO timestamp from the last GET /profiles/content or PUT /profiles/content ' +
+      'response (`updatedAt` field). Omit for the first save. ' +
+      'Returns 409 if the server draft was modified after this timestamp.',
+    required: false,
+    example: '2026-05-19T16:05:00.000Z',
   })
   @ApiResponse({
     status: 200,
-    description: 'Profile publish state updated successfully',
+    type: ProfileDraftResponseDto,
+    description: 'Draft saved successfully',
+  })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({ status: 404, description: 'Profile not found' })
+  @ApiResponse({
+    status: 409,
+    description: 'Concurrent edit — re-fetch and retry',
+  })
+  @ApiResponse({ status: 422, description: 'Content validation failed' })
+  async upsertDraft(
+    @currentUserDecorator.CurrentUser('sub') userId: string,
+    @Headers('x-draft-version') draftVersion: string | undefined,
+    @Body() dto: UpsertDraftDto,
+  ): Promise<ProfileDraftResponseDto> {
+    return this.profileService.upsertDraft(userId, dto, draftVersion);
+  }
+
+  @Get('content/state')
+  @HttpCode(HttpStatus.OK)
+  @ApiBearerAuth('JWT')
+  @ApiOperation({
+    summary: 'Check whether the authenticated user has an unpublished draft',
+  })
+  @ApiResponse({ status: 200, description: 'Draft state returned' })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({ status: 404, description: 'Profile not found' })
+  async getDraftState(@currentUserDecorator.CurrentUser('sub') userId: string) {
+    return this.profileService.getDraftState(userId);
+  }
+
+  @Get('content')
+  @HttpCode(HttpStatus.OK)
+  @ApiBearerAuth('JWT')
+  @ApiOperation({
+    summary: 'Get full editable canvas content for authenticated user',
   })
   @ApiResponse({
-    status: 400,
-    description: 'Publish requirements not met',
+    status: 200,
+    description:
+      'Returns the draft if one exists (source: "draft"), otherwise falls back to the published profile row (source: "published").',
+    type: ProfileDraftResponseDto,
+  })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({
+    status: 404,
+    description: 'Profile not found. Please complete onboarding first.',
+  })
+  async getProfileContent(
+    @currentUserDecorator.CurrentUser('sub') userId: string,
+  ): Promise<ProfileDraftResponseDto> {
+    return this.profileService.getProfileContent(userId);
+  }
+
+  @Post('publish')
+  @HttpCode(HttpStatus.OK)
+  @ApiBearerAuth('JWT')
+  @ApiBody({ type: PublishProfileDto })
+  @ApiOperation({
+    summary: 'Publish authenticated user profile draft',
   })
   @ApiResponse({
-    status: 401,
-    description: 'Unauthorized',
+    status: 200,
+    description: 'Profile published successfully',
+  })
+  @ApiResponse({
+    status: 409,
+    description: 'Concurrent conflict',
   })
   @ApiResponse({
     status: 404,
     description: 'Profile not found',
   })
-  @ApiResponse({
-    status: 422,
-    description: 'Invalid action',
-  })
   async publishProfile(
     @currentUserDecorator.CurrentUser('sub') userId: string,
-    @Body() dto: PublishProfileDto,
   ) {
-    return this.profileService.publishProfile(userId, dto);
+    return this.profileService.publishProfile(userId);
   }
 
   @Patch(':username')
   @HttpCode(HttpStatus.OK)
   @ApiBearerAuth('JWT')
-  @ApiConsumes('multipart/form-data')
   @ApiOperation({ summary: 'Update profile fields for the authenticated user' })
   @ApiParam({ name: 'username', description: 'The profile username' })
-  @ApiBody({
-    schema: {
-      type: 'object',
-      properties: {
-        fullName: { type: 'string', maxLength: 100 },
-        bio: { type: 'string', maxLength: 200, nullable: true },
-        photo: { type: 'string', format: 'binary' },
-      },
-    },
+  @ApiResponse({
+    status: 200,
+    type: ProfileResponseDto,
+    description: 'Profile updated successfully',
   })
-  @ApiResponse({ status: 200, description: 'Profile updated successfully' })
   @ApiResponse({ status: 401, description: 'Unauthenticated' })
   @ApiResponse({
     status: 403,
     description: 'Profile does not belong to the authenticated user',
   })
   @ApiResponse({ status: 404, description: 'Profile not found' })
-  @ApiResponse({ status: 422, description: 'Validation error' })
-  @UseInterceptors(
-    FileInterceptor('photo', {
-      storage: profilePhotoStorage,
-      fileFilter: profilePhotoFilter,
-      limits: profilePhotoLimits,
-    }),
-  )
+  @ApiResponse({ status: 422, description: 'Profile update validation failed' })
   async updateProfile(
     @Param('username') username: string,
     @Body() dto: UpdateProfileDto,
     @currentUserDecorator.CurrentUser('sub') userId: string,
-    @UploadedFile() file?: Express.Multer.File,
   ) {
-    return this.profileService.updateProfile(username, dto, userId, file);
+    return this.profileService.updateProfile(username, dto, userId);
   }
 
   @Get('dashboard')
@@ -145,7 +203,11 @@ export class ProfileController {
   @ApiOperation({
     summary: 'Get full current profile data for the authenticated user',
   })
-  @ApiResponse({ status: 200, description: 'Profile returned successfully' })
+  @ApiResponse({
+    status: 200,
+    type: DashboardProfileResponseDto,
+    description: 'Profile returned successfully',
+  })
   @ApiResponse({ status: 401, description: 'Unauthorized' })
   @ApiResponse({
     status: 404,
@@ -205,16 +267,6 @@ export class ProfileController {
     return data;
   }
 
-  /**
-   * PATCH /profiles/me/components/:componentId
-   *
-   * Toggle visibility or edit a component owned by the authenticated user.
-   * Global JwtAuthGuard handles auth; @CurrentUser('sub') gives us the
-   * user ID (JWT subject claim).
-   *
-   * `displayOrder` is intentionally not patchable — the global
-   * ValidationPipe with forbidNonWhitelisted: true rejects it.
-   */
   @Patch('me/components/:componentId')
   @HttpCode(HttpStatus.OK)
   @ApiBearerAuth('JWT')
@@ -230,13 +282,6 @@ export class ProfileController {
     return this.profileService.patchComponent(userId, componentId, dto);
   }
 
-  /**
-   * PUT /profiles/me/components/order
-   *
-   * Replace the full ordering of components for the authenticated user's
-   * profile in one atomic write. The body's array order becomes the new
-   * top-to-bottom display order.
-   */
   @Put('me/components/order')
   @HttpCode(HttpStatus.OK)
   @ApiBearerAuth('JWT')

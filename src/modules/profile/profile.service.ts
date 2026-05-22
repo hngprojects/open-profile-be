@@ -8,7 +8,6 @@ import {
   NotFoundException,
   ForbiddenException,
   ConflictException,
-  BadRequestException,
   UnprocessableEntityException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
@@ -17,14 +16,19 @@ import * as crypto from 'crypto';
 import { RedisService } from '../../common/redis/redis.service';
 import { Profile } from './entities/profile.entity';
 import { ProfileComponent } from './entities/profile-component.entity';
+import { ProfileDraft } from './entities/profile-draft.entity';
 import { CreateProfileDto } from './dto/create-profile.dto';
 import { UpdateProfileDto } from './dto/update-profile.dto';
 import { AuthenticatedUser } from '../../common/decorators/current-user.decorator';
 import { UsernamesService } from '../usernames/usernames.service';
-import { PublishProfileDto } from './dto/publish-profile.dto';
-
+import { UpsertDraftDto } from './dto/upsert-draft.dto';
+import { ProfileDraftResponseDto } from './dto/profile-draft-response.dto';
+import {
+  ProfileResponseDto,
+  DashboardProfileResponseDto,
+  PublicProfileResponseDto,
+} from './dto/profile-response.dto';
 const CACHE_TTL_SECONDS = 60;
-const MAX_COMPONENTS = 50;
 const CACHE_404_TTL_SECONDS = 30;
 
 @Injectable()
@@ -36,6 +40,8 @@ export class ProfileService {
     private readonly profileRepo: Repository<Profile>,
     @InjectRepository(ProfileComponent)
     private readonly componentRepo: Repository<ProfileComponent>,
+    @InjectRepository(ProfileDraft)
+    private readonly profileDraftRepo: Repository<ProfileDraft>,
     @InjectRepository(User)
     private readonly userRepo: Repository<User>,
     private readonly redisService: RedisService,
@@ -43,10 +49,29 @@ export class ProfileService {
     private readonly usernamesService: UsernamesService,
   ) {}
 
+  private toProfileResponse(profile: Profile): ProfileResponseDto {
+    return {
+      id: profile.id,
+      username: profile.username,
+      fullName: profile.fullName,
+      bio: profile.bio,
+      photoUrl: profile.photoUrl,
+      templateType: profile.templateType,
+      themeSettings: profile.themeSettings,
+      ctaLabel: profile.ctaLabel,
+      ctaUrl: profile.ctaUrl,
+      isPublished: profile.isPublished,
+      hasUnpublishedChanges: profile.hasUnpublishedChanges,
+      isVerified: profile.isVerified,
+      createdAt: profile.createdAt,
+      updatedAt: profile.updatedAt,
+    };
+  }
+
   async createProfile(
     createProfileDto: CreateProfileDto,
     user: AuthenticatedUser,
-  ): Promise<Profile> {
+  ): Promise<ProfileResponseDto> {
     // Step 1 - check if user already has a profile
     const existingProfile = await this.profileRepo.findOne({
       where: { userId: user.sub },
@@ -65,10 +90,11 @@ export class ProfileService {
       if (usernameCheck.reason === 'TAKEN') {
         throw new ConflictException('Username already taken');
       }
-      throw new UnprocessableEntityException(
-        'Username must be 3-30 characters, use only letters, numbers, and hyphens, ' +
-          'and must not start, end, or contain consecutive hyphens.',
-      );
+      throw new UnprocessableEntityException({
+        error: 'INVALID_USERNAME_FORMAT',
+        message:
+          'Username must be 3-30 characters, use only letters, numbers, and hyphens, and must not start, end, or contain consecutive hyphens.',
+      });
     }
 
     // Step 3 - fetch user record to get fullName stored at registration
@@ -112,11 +138,11 @@ export class ProfileService {
       return saved;
     });
 
-    return savedProfile;
+    return this.toProfileResponse(savedProfile);
   }
 
   async getPublicProfile(username: string): Promise<{
-    data: Record<string, unknown>;
+    data: PublicProfileResponseDto;
     etag: string;
     fromCache: boolean;
   }> {
@@ -126,7 +152,7 @@ export class ProfileService {
 
     const cached = await this.redisService.get(cacheKey);
     if (cached) {
-      const parsed = JSON.parse(cached) as Record<string, unknown>;
+      const parsed = JSON.parse(cached) as PublicProfileResponseDto;
       if (parsed['__notFound']) {
         throw new NotFoundException({ error: 'not_found' });
       }
@@ -161,17 +187,7 @@ export class ProfileService {
         throw new NotFoundException({ error: 'not_found' });
       }
 
-      const components = await this.componentRepo.find({
-        where: { profileId: profile.id, isEnabled: true },
-        order: { displayOrder: 'ASC' },
-        take: MAX_COMPONENTS,
-      });
-
-      const activeComponents = components.filter(
-        (c) => c.metadata && Object.keys(c.metadata).length > 0,
-      );
-
-      const responseData = this.serialize(profile, activeComponents);
+      const responseData = this.serialize(profile);
       const serialized = JSON.stringify(responseData);
 
       this.logger.log(`Cache miss for profile: ${normalizedUsername}`);
@@ -186,7 +202,9 @@ export class ProfileService {
     }
   }
 
-  async getDashboardProfile(userId: string): Promise<Record<string, unknown>> {
+  async getDashboardProfile(
+    userId: string,
+  ): Promise<DashboardProfileResponseDto> {
     const profile = await this.profileRepo.findOne({
       where: { userId, deletedAt: IsNull() },
     });
@@ -203,16 +221,7 @@ export class ProfileService {
     });
 
     return {
-      username: profile.username,
-      fullName: profile.fullName,
-      bio: profile.bio,
-      photoUrl: profile.photoUrl,
-      templateType: profile.templateType,
-      themeSettings: profile.themeSettings,
-      isPublished: profile.isPublished,
-      hasUnpublishedChanges: profile.hasUnpublishedChanges,
-      ctaLabel: profile.ctaLabel ?? null,
-      ctaUrl: profile.ctaUrl ?? null,
+      ...this.toProfileResponse(profile),
       components: components.map((c) => ({
         id: c.id,
         sectionType: c.sectionType,
@@ -229,27 +238,16 @@ export class ProfileService {
     await this.redisService.del(`profile:${username.toLowerCase()}`);
   }
 
-  private serialize(
-    profile: Profile,
-    components: ProfileComponent[],
-  ): Record<string, unknown> {
+  private serialize(profile: Profile): PublicProfileResponseDto {
     return {
       username: profile.username,
       fullName: profile.fullName ?? null,
-      bio: profile.bio,
       photoUrl: profile.photoUrl,
       templateType: profile.templateType,
       themeSettings: profile.themeSettings,
-      components: components.map((c) => ({
-        sectionType: c.sectionType,
-        title: c.title,
-        content: c.content,
-        displayOrder: c.displayOrder,
-        metadata: c.metadata,
-      })),
+      content: profile.content ?? null,
     };
   }
-
   private computeEtag(content: string): string {
     return `"${crypto.createHash('md5').update(content).digest('hex')}"`;
   }
@@ -397,8 +395,7 @@ export class ProfileService {
     username: string,
     dto: UpdateProfileDto,
     userId: string,
-    file?: Express.Multer.File,
-  ): Promise<Record<string, unknown>> {
+  ): Promise<ProfileResponseDto> {
     const profile = await this.profileRepo.findOne({
       where: { username: username.toLowerCase(), deletedAt: IsNull() },
     });
@@ -417,100 +414,243 @@ export class ProfileService {
 
     if (dto.fullName !== undefined) profile.fullName = dto.fullName;
     if (dto.bio !== undefined) profile.bio = dto.bio;
-    if (file) profile.photoUrl = `/${file.path.replace(/\\/g, '/')}`;
+    if (dto.photoUrl !== undefined) profile.photoUrl = dto.photoUrl;
 
     profile.hasUnpublishedChanges = true;
 
     const saved = await this.profileRepo.save(profile);
     await this.invalidateCache(saved.username);
 
-    return {
-      username: saved.username,
-      fullName: saved.fullName,
-      bio: saved.bio,
-      photoUrl: saved.photoUrl,
-      hasUnpublishedChanges: saved.hasUnpublishedChanges,
-    };
+    return this.toProfileResponse(saved);
   }
 
-  async publishProfile(
-    userId: string,
-    dto: PublishProfileDto,
-  ): Promise<Record<string, string>> {
-    const { action } = dto;
-
-    if (!action) {
-      throw new UnprocessableEntityException({
-        message: 'Please specify an action: publish or unpublish.',
-      });
-    }
-
-    if (action !== 'publish' && action !== 'unpublish') {
-      throw new UnprocessableEntityException({
-        message: 'Action must be either publish or unpublish.',
-      });
-    }
-
+  async publishProfile(userId: string) {
     const profile = await this.profileRepo.findOne({
-      where: {
-        userId,
-        deletedAt: IsNull(),
-      },
+      where: { userId, deletedAt: IsNull() },
     });
 
     if (!profile) {
-      throw new NotFoundException({
-        message: 'Complete your profile setup before publishing.',
-      });
+      throw new NotFoundException('Complete onboarding before publishing.');
     }
 
-    /**
-     * PUBLISH
-     */
-    if (action === 'publish') {
-      const missingRequirements = !profile.fullName || !profile.username;
+    const result = await this.dataSource.transaction(async (tx) => {
+      const draftRepo = tx.getRepository(ProfileDraft);
+      const profileRepo = tx.getRepository(Profile);
 
-      if (missingRequirements) {
-        throw new BadRequestException({
-          error: 'PUBLISH_REQUIREMENTS_NOT_MET',
-          message:
-            'Your profile needs a fullName and username before it can be published.',
-        });
+      const draft = await draftRepo.findOne({
+        where: { profileId: profile.id },
+      });
+
+      if (!draft) {
+        return {
+          status: 'success',
+          message: 'Profile is already up to date. Nothing to publish.',
+          data: {
+            profileId: profile.id,
+            username: profile.username,
+            publishedAt: profile.updatedAt.toISOString(),
+          },
+        };
       }
 
-      /**
-       * Idempotent behavior:
-       * already published => still return success
-       */
-      if (!profile.isPublished) {
-        profile.isPublished = true;
-      }
-      profile.hasUnpublishedChanges = false;
-      await this.profileRepo.save(profile);
+      const updatedProfile = profileRepo.create({
+        ...profile,
+        bio: draft.bio ?? profile.bio,
+        photoUrl: draft.photoUrl ?? profile.photoUrl,
+        content: draft.content ?? profile.content,
+        fullName: draft.fullName ?? profile.fullName,
+        themeSettings: draft.themeSettings ?? profile.themeSettings,
+        isPublished: true,
+        updatedAt: new Date(),
+      });
 
-      await this.invalidateCache(profile.username);
+      await profileRepo.save(updatedProfile);
+
+      await draftRepo.delete({
+        profileId: profile.id,
+      });
 
       return {
         status: 'success',
-        message: 'Your profile is now live.',
-        profileUrl: `openprofile.com/${profile.username}`,
+        message: 'Profile published successfully',
+        data: {
+          profileId: profile.id,
+          username: profile.username,
+          publishedAt: new Date().toISOString(),
+        },
       };
-    }
-
-    /**
-     * UNPUBLISH
-     */
-    if (profile.isPublished) {
-      profile.isPublished = false;
-      await this.profileRepo.save(profile);
-    }
+    });
 
     await this.invalidateCache(profile.username);
 
+    return result;
+  }
+
+  async getProfileContent(userId: string): Promise<ProfileDraftResponseDto> {
+    const profile = await this.profileRepo.findOne({
+      where: { userId, deletedAt: IsNull() },
+    });
+
+    if (!profile) {
+      throw new NotFoundException(
+        'Profile not found. Please complete onboarding first.',
+      );
+    }
+
+    const draft = await this.profileDraftRepo.findOne({
+      where: { profileId: profile.id },
+    });
+
+    if (draft) {
+      return {
+        profileId: profile.id,
+        bio: draft.bio ?? profile.bio ?? null,
+        photoUrl: draft.photoUrl ?? profile.photoUrl ?? null,
+        content: draft.content ?? profile.content ?? null,
+        themeSettings: draft.themeSettings ?? profile.themeSettings ?? null,
+        source: 'draft',
+        updatedAt: draft.updatedAt,
+      };
+    }
+
+    if (profile.content) {
+      return {
+        profileId: profile.id,
+        bio: profile.bio,
+        photoUrl: profile.photoUrl,
+        content: profile.content,
+        themeSettings: profile.themeSettings,
+        source: 'published',
+        updatedAt: profile.updatedAt,
+      };
+    }
+
+    return {
+      profileId: profile.id,
+      bio: profile.bio,
+      photoUrl: profile.photoUrl,
+      content: {
+        sectionOrder: ['bio', 'links', 'projects', 'cta'],
+        bio: { visible: true, content: profile.bio ?? '' },
+        links: { visible: true, sectionTitle: 'Links', items: [] },
+        projects: { visible: true, sectionTitle: 'Projects', items: [] },
+        cta: {
+          visible: true,
+          label: profile.ctaLabel ?? '',
+          url: profile.ctaUrl ?? null,
+        },
+      },
+      themeSettings: profile.themeSettings,
+      source: 'published',
+      updatedAt: profile.updatedAt,
+    };
+  }
+
+  async upsertDraft(
+    userId: string,
+    dto: UpsertDraftDto,
+    draftVersion?: string,
+  ): Promise<ProfileDraftResponseDto> {
+    const profile = await this.profileRepo.findOne({
+      where: { userId, deletedAt: IsNull() },
+      select: ['id'],
+    });
+
+    if (!profile) {
+      throw new NotFoundException(
+        'Profile not found. Please complete onboarding first.',
+      );
+    }
+
+    const saved = await this.dataSource.transaction(async (manager) => {
+      const draftRepo = manager.getRepository(ProfileDraft);
+      await manager
+        .getRepository(Profile)
+        .createQueryBuilder('p')
+        .where('p.id = :profileId', { profileId: profile.id })
+        .setLock('pessimistic_write')
+        .getOneOrFail();
+      // Lock the existing draft row if it exists — prevents concurrent writes
+      const existingDrafts = await draftRepo
+        .createQueryBuilder('d')
+        .where('d.profile_id = :profileId', { profileId: profile.id })
+        .setLock('pessimistic_write')
+        .getMany();
+
+      const existingDraft = existingDrafts[0] ?? null;
+
+      // Concurrency check — only if caller sent a token
+      if (draftVersion && existingDraft) {
+        if (existingDraft.updatedAt.toISOString() !== draftVersion) {
+          throw new ConflictException(
+            'Draft was modified by another session. ' +
+              'Re-fetch (GET /profiles/content) and retry.',
+          );
+        }
+      }
+
+      const draft = draftRepo.create({
+        ...(existingDraft ? { id: existingDraft.id } : {}),
+        profileId: profile.id,
+        bio: dto.bio !== undefined ? dto.bio : (existingDraft?.bio ?? null),
+        photoUrl:
+          dto.photoUrl !== undefined
+            ? dto.photoUrl
+            : (existingDraft?.photoUrl ?? null),
+        content:
+          dto.content !== undefined
+            ? dto.content
+            : (existingDraft?.content ?? null),
+        themeSettings:
+          dto.themeSettings !== undefined
+            ? dto.themeSettings
+            : (existingDraft?.themeSettings ?? null),
+      });
+
+      return draftRepo.save(draft);
+    });
+
+    return {
+      profileId: profile.id,
+      bio: saved.bio,
+      photoUrl: saved.photoUrl,
+      content: saved.content,
+      themeSettings: saved.themeSettings,
+      source: 'draft',
+      updatedAt: saved.updatedAt,
+    };
+  }
+
+  async getDraftState(userId: string): Promise<{
+    status: string;
+    hasDraft: boolean;
+    draftId?: string;
+    updatedAt?: Date;
+  }> {
+    const profile = await this.profileRepo.findOne({
+      where: { userId, deletedAt: IsNull() },
+      select: ['id'],
+    });
+    if (!profile) {
+      throw new NotFoundException(
+        'Profile not found. Please complete onboarding first.',
+      );
+    }
+
+    const draft = await this.profileDraftRepo.findOne({
+      where: { profileId: profile.id },
+      select: ['id', 'updatedAt'],
+    });
+
+    if (!draft) {
+      return { status: 'success', hasDraft: false };
+    }
+
     return {
       status: 'success',
-      message:
-        'Your profile has been unpublished. It is no longer visible to the public.',
+      hasDraft: true,
+      draftId: draft.id,
+      updatedAt: draft.updatedAt,
     };
   }
 }

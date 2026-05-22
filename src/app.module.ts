@@ -3,6 +3,7 @@ import {
   UnprocessableEntityException,
   ValidationPipe,
 } from '@nestjs/common';
+import { ScheduleModule } from '@nestjs/schedule';
 import { LoggerModule } from 'nestjs-pino';
 import { ConfigModule } from '@nestjs/config';
 import { APP_FILTER, APP_GUARD, APP_INTERCEPTOR, APP_PIPE } from '@nestjs/core';
@@ -29,6 +30,8 @@ import { SearchModule } from './modules/search/search.module';
 import { ContactModule } from './modules/contact/contact.module';
 import { PortfolioModule } from './modules/portfolio/portfolio.module';
 import { AnalyticsModule } from './modules/analytics/analytics.module';
+import { UploadModule } from './modules/upload/upload.module';
+import { ValidationError } from 'class-validator';
 
 @Module({
   imports: [
@@ -43,9 +46,10 @@ import { AnalyticsModule } from './modules/analytics/analytics.module';
           process.env.NODE_ENV !== 'production'
             ? { target: 'pino-pretty' }
             : undefined,
-        autoLogging: true, // logs every HTTP request automatically
+        autoLogging: true,
       },
     }),
+    ScheduleModule.forRoot(),
     ThrottlerModule.forRoot([
       {
         ttl: 60_000,
@@ -68,6 +72,7 @@ import { AnalyticsModule } from './modules/analytics/analytics.module';
     AnalyticsModule,
     ContactModule,
     PortfolioModule,
+    UploadModule,
   ],
   providers: [
     {
@@ -78,10 +83,27 @@ import { AnalyticsModule } from './modules/analytics/analytics.module';
         forbidNonWhitelisted: true,
         transformOptions: { enableImplicitConversion: false },
         exceptionFactory: (errors) => {
-          const formatted = errors.map((e) => ({
-            field: e.property,
-            error: Object.values(e.constraints ?? {}).join(', '),
-          }));
+          const flatten = (
+            errs: ValidationError[],
+            parentField = '',
+          ): { field: string; error: string }[] => {
+            const result: { field: string; error: string }[] = [];
+            for (const e of errs) {
+              const field = parentField
+                ? `${parentField}.${e.property}`
+                : e.property;
+              const constraints = Object.values(e.constraints ?? {});
+              if (constraints.length > 0) {
+                result.push({ field, error: constraints.join(', ') });
+              }
+              if (e.children?.length) {
+                result.push(...flatten(e.children, field));
+              }
+            }
+            return result;
+          };
+
+          const formatted = flatten(errors);
           return new UnprocessableEntityException(formatted);
         },
       }),

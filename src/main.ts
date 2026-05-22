@@ -42,7 +42,13 @@ async function bootstrap() {
     origin: corsOrigin,
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-CSRF-Token'],
+    allowedHeaders: [
+      'Content-Type',
+      'Authorization',
+      'X-CSRF-Token',
+      'X-Draft-Version',
+    ],
+    exposedHeaders: ['X-Draft-Version'],
   });
 
   app.setGlobalPrefix('api', {
@@ -51,11 +57,17 @@ async function bootstrap() {
 
   app.enableVersioning({ type: VersioningType.URI, defaultVersion: '1' });
 
-  const uploadsDir = join(process.cwd(), 'uploads', 'profiles');
-  fs.mkdirSync(uploadsDir, { recursive: true });
+  const profileUploadsDir = join(process.cwd(), 'uploads', 'profiles');
+  fs.mkdirSync(profileUploadsDir, { recursive: true });
+  const projectUploadsDir = join(process.cwd(), 'uploads', 'projects');
+  fs.mkdirSync(projectUploadsDir, { recursive: true });
   app.use(
     '/uploads',
-    (_req: express.Request, res: express.Response, next: express.NextFunction) => {
+    (
+      _req: express.Request,
+      res: express.Response,
+      next: express.NextFunction,
+    ) => {
       res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
       next();
     },

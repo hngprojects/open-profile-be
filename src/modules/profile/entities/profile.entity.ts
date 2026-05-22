@@ -12,6 +12,8 @@ import {
 } from 'typeorm';
 import { User } from '../../users/entities/user.entity';
 import { ProfileComponent } from './profile-component.entity';
+import { ProfileContentDto } from '../dto/profile-content.dto';
+import { ThemeSettings } from '../dto/theme-settings.dto';
 
 @Entity('profiles')
 export class Profile {
@@ -42,7 +44,15 @@ export class Profile {
   templateType: string | null;
 
   @Column({ name: 'theme_settings', nullable: true, type: 'jsonb' })
-  themeSettings: Record<string, unknown> | null;
+  themeSettings: ThemeSettings | null;
+
+  // Persisted editable canvas content document.
+
+  @Column({
+    type: 'jsonb',
+    nullable: true,
+  })
+  content: ProfileContentDto | null;
 
   @Column({ type: 'varchar', name: 'cta_label', nullable: true })
   ctaLabel: string | null;
@@ -59,7 +69,11 @@ export class Profile {
   @Column({ type: 'boolean', name: 'is_published', default: false })
   isPublished: boolean;
 
-  @Column({ type: 'boolean', name: 'has_unpublished_changes', default: false })
+  @Column({
+    type: 'boolean',
+    name: 'has_unpublished_changes',
+    default: false,
+  })
   hasUnpublishedChanges: boolean;
 
   @OneToMany(() => ProfileComponent, (component) => component.profile)
