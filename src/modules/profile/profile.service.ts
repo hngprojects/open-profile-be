@@ -23,11 +23,22 @@ import { AuthenticatedUser } from '../../common/decorators/current-user.decorato
 import { UsernamesService } from '../usernames/usernames.service';
 import { UpsertDraftDto } from './dto/upsert-draft.dto';
 import { ProfileDraftResponseDto } from './dto/profile-draft-response.dto';
+import { CtaDto, CtaType, ProfileContentDto } from './dto/profile-content.dto';
 import {
   ProfileResponseDto,
   DashboardProfileResponseDto,
   PublicProfileResponseDto,
 } from './dto/profile-response.dto';
+import { AppearanceSettingsDto } from './dto/appearance-settings.dto';
+import { DEFAULT_APPEARANCE } from './constants/default-appearance';
+import { LinkItemDto } from './dto/profile-content.dto';
+import { SectionType } from './dto/profile-content.dto';
+import {
+  sanitizeUrl,
+  isValidUrl,
+  encodeUrlForBackend,
+} from './utils/link.utils';
+import dns from 'node:dns/promises';
 const CACHE_TTL_SECONDS = 60;
 const CACHE_404_TTL_SECONDS = 30;
 
@@ -42,8 +53,6 @@ export class ProfileService {
     private readonly componentRepo: Repository<ProfileComponent>,
     @InjectRepository(ProfileDraft)
     private readonly profileDraftRepo: Repository<ProfileDraft>,
-    @InjectRepository(User)
-    private readonly userRepo: Repository<User>,
     private readonly redisService: RedisService,
     private readonly dataSource: DataSource,
     private readonly usernamesService: UsernamesService,
@@ -97,17 +106,7 @@ export class ProfileService {
       });
     }
 
-    // Step 3 - fetch user record to get fullName stored at registration
-    const dbUser = await this.userRepo.findOne({
-      where: { id: user.sub },
-      select: ['fullName'],
-    });
-
-    if (!dbUser) {
-      throw new NotFoundException('User not found');
-    }
-
-    // Step 4 - create and save the profile
+    // Step 3 - create and save the profile
     const profile = this.profileRepo.create({
       userId: user.sub,
       username: usernameCheck.normalizedUsername, // already trimmed + lowercased by UsernamesService
@@ -117,7 +116,7 @@ export class ProfileService {
       isPublished: createProfileDto.isPublished ?? true,
     });
 
-    // Step 5 - persist profile + flip onboarding flag atomically.
+    // Step 4 - persist profile + flip onboarding flag atomically.
     // If either write fails the transaction rolls back, leaving the user
     // in a clean state where they can retry without hitting a conflict.
     const savedProfile = await this.dataSource.transaction(async (manager) => {
@@ -239,18 +238,76 @@ export class ProfileService {
   }
 
   private serialize(profile: Profile): PublicProfileResponseDto {
+    const defaultContent: ProfileContentDto = {
+      sectionOrder: [
+        SectionType.BIO,
+        SectionType.LINKS,
+        SectionType.PROJECTS,
+        SectionType.CTA,
+      ],
+      bio: { visible: true, content: profile.bio ?? '' },
+      links: { visible: true, sectionTitle: 'Links', items: [] },
+      projects: { visible: true, sectionTitle: 'Projects', items: [] },
+      cta: {
+        visible: true,
+        type: CtaType.LINK,
+        label: profile.ctaLabel ?? '',
+        value: profile.ctaUrl ?? null,
+        title: "Let's build something",
+        subtitle: '',
+        layout: '1',
+        iconId: null,
+        iconSrc: null,
+        iconLabel: null,
+      },
+    };
+
+    const rawCta: Partial<CtaDto> & {
+      type?: CtaType;
+      url?: string | null;
+    } = profile.content?.cta ?? {};
+
+    const content: ProfileContentDto = {
+      ...defaultContent,
+      ...(profile.content ?? {}),
+      bio: {
+        ...defaultContent.bio,
+        ...(profile.content?.bio ?? {}),
+      },
+      links: {
+        ...defaultContent.links,
+        ...(profile.content?.links ?? {}),
+      },
+      projects: {
+        ...defaultContent.projects,
+        ...(profile.content?.projects ?? {}),
+      },
+      cta: {
+        ...defaultContent.cta,
+        ...rawCta,
+        type: rawCta.type ?? CtaType.LINK,
+        value:
+          rawCta.type === CtaType.EMAIL
+            ? (rawCta.value ?? null)
+            : (rawCta.value ?? rawCta.url ?? null),
+      },
+    };
+
     return {
       username: profile.username,
       fullName: profile.fullName ?? null,
       photoUrl: profile.photoUrl,
       templateType: profile.templateType,
       themeSettings: profile.themeSettings,
-      content: profile.content ?? null,
+      appearance: profile.appearance,
+      content,
     };
   }
+
   private computeEtag(content: string): string {
     return `"${crypto.createHash('md5').update(content).digest('hex')}"`;
   }
+
   /**
    * PATCH /profiles/me/components/:componentId
    *
@@ -453,6 +510,19 @@ export class ProfileService {
         };
       }
 
+      // 1. Validate visible link items
+      const linkItems =
+        draft.content?.links?.items ?? profile.content?.links?.items ?? [];
+      if (linkItems.some((i) => i.visible)) {
+        await this.validateLinkItems(linkItems);
+      }
+
+      // Validate CTA — catches drafts that predate CTA validation
+      const cta = draft.content?.cta;
+      if (cta) {
+        this.validateCtaContent(cta);
+      }
+
       const updatedProfile = profileRepo.create({
         ...profile,
         bio: draft.bio ?? profile.bio,
@@ -460,15 +530,14 @@ export class ProfileService {
         content: draft.content ?? profile.content,
         fullName: draft.fullName ?? profile.fullName,
         themeSettings: draft.themeSettings ?? profile.themeSettings,
+        appearance: draft.appearance ?? profile.appearance,
         isPublished: true,
         updatedAt: new Date(),
       });
 
       await profileRepo.save(updatedProfile);
 
-      await draftRepo.delete({
-        profileId: profile.id,
-      });
+      await draftRepo.delete({ profileId: profile.id });
 
       return {
         status: 'success',
@@ -501,49 +570,208 @@ export class ProfileService {
       where: { profileId: profile.id },
     });
 
-    if (draft) {
-      return {
-        profileId: profile.id,
-        bio: draft.bio ?? profile.bio ?? null,
-        photoUrl: draft.photoUrl ?? profile.photoUrl ?? null,
-        content: draft.content ?? profile.content ?? null,
-        themeSettings: draft.themeSettings ?? profile.themeSettings ?? null,
-        source: 'draft',
-        updatedAt: draft.updatedAt,
-      };
-    }
+    const baseContent: ProfileContentDto = {
+      sectionOrder: [
+        SectionType.BIO,
+        SectionType.LINKS,
+        SectionType.PROJECTS,
+        SectionType.CTA,
+      ],
+      bio: { visible: true, content: profile.bio ?? '' },
+      links: { visible: true, sectionTitle: 'Links', items: [] },
+      projects: { visible: true, sectionTitle: 'Projects', items: [] },
+      cta: {
+        visible: true,
+        type: CtaType.LINK,
+        label: profile.ctaLabel ?? '',
+        value: profile.ctaUrl ?? null,
+      },
+    };
 
-    if (profile.content) {
-      return {
-        profileId: profile.id,
-        bio: profile.bio,
-        photoUrl: profile.photoUrl,
-        content: profile.content,
-        themeSettings: profile.themeSettings,
-        source: 'published',
-        updatedAt: profile.updatedAt,
-      };
-    }
+    const rawCta: Partial<CtaDto> & {
+      url?: string | null;
+    } = draft?.content?.cta ?? profile.content?.cta ?? {};
+
+    const content: ProfileContentDto = {
+      ...baseContent,
+      ...(profile.content ?? {}),
+      ...(draft?.content ?? {}),
+      bio: {
+        ...baseContent.bio,
+        ...(profile.content?.bio ?? {}),
+        ...(draft?.content?.bio ?? {}),
+      },
+      links: {
+        ...baseContent.links,
+        ...(profile.content?.links ?? {}),
+        ...(draft?.content?.links ?? {}),
+      },
+      projects: {
+        ...baseContent.projects,
+        ...(profile.content?.projects ?? {}),
+        ...(draft?.content?.projects ?? {}),
+      },
+      cta: {
+        ...baseContent.cta,
+        ...(profile.content?.cta ?? {}),
+        ...(draft?.content?.cta ?? {}),
+        type: rawCta.type ?? CtaType.LINK,
+        value:
+          rawCta.type === CtaType.EMAIL
+            ? (rawCta.value ?? null)
+            : (rawCta.value ?? rawCta.url ?? null),
+      },
+    };
 
     return {
       profileId: profile.id,
-      bio: profile.bio,
-      photoUrl: profile.photoUrl,
-      content: {
-        sectionOrder: ['bio', 'links', 'projects', 'cta'],
-        bio: { visible: true, content: profile.bio ?? '' },
-        links: { visible: true, sectionTitle: 'Links', items: [] },
-        projects: { visible: true, sectionTitle: 'Projects', items: [] },
-        cta: {
-          visible: true,
-          label: profile.ctaLabel ?? '',
-          url: profile.ctaUrl ?? null,
-        },
-      },
-      themeSettings: profile.themeSettings,
-      source: 'published',
-      updatedAt: profile.updatedAt,
+      bio: draft?.bio ?? profile.bio ?? null,
+      photoUrl: draft?.photoUrl ?? profile.photoUrl ?? null,
+      content,
+      themeSettings: draft?.themeSettings ?? profile.themeSettings ?? null,
+      source: draft ? 'draft' : 'published',
+      updatedAt: draft?.updatedAt ?? profile.updatedAt,
     };
+  }
+
+  private validateCtaContent(cta: Partial<CtaDto>): void {
+    if (!cta.visible) return;
+
+    const effectiveType = cta.type ?? CtaType.LINK;
+
+    if (effectiveType === CtaType.EMAIL) {
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!cta.value || !emailRegex.test(cta.value.trim())) {
+        throw new UnprocessableEntityException({
+          error: 'INVALID_CTA',
+          message: 'CTA email must be a valid email address.',
+        });
+      }
+    } else {
+      if (!cta.value) return;
+      let parsed: URL;
+      try {
+        parsed = new URL(cta.value);
+      } catch {
+        throw new UnprocessableEntityException({
+          error: 'INVALID_CTA',
+          message: 'CTA URL is not a valid URL.',
+        });
+      }
+      if (!['http:', 'https:'].includes(parsed.protocol)) {
+        throw new UnprocessableEntityException({
+          error: 'INVALID_CTA',
+          message: 'CTA URL must use http or https.',
+        });
+      }
+    }
+  }
+
+  validateLink(
+    url: string,
+    iconId?: string,
+  ): {
+    original: string;
+    sanitized: string;
+    encoded: string;
+  } {
+    const sanitized = sanitizeUrl(url);
+
+    if (sanitized === '#') {
+      throw new UnprocessableEntityException({
+        error: 'DANGEROUS_URL',
+        message: 'URL contains a dangerous scheme and cannot be used.',
+      });
+    }
+
+    if (!isValidUrl(sanitized, iconId)) {
+      throw new UnprocessableEntityException({
+        error: 'INVALID_URL',
+        message: 'Invalid URL format.',
+      });
+    }
+
+    return {
+      original: url,
+      sanitized,
+      encoded: encodeUrlForBackend(sanitized, iconId),
+    };
+  }
+
+  private async validateLinkItems(items: LinkItemDto[]): Promise<void> {
+    const visibleItems = items.filter((item) => item.visible);
+
+    if (visibleItems.length === 0) return;
+
+    const results = await Promise.all(
+      visibleItems.map(async (item) => {
+        try {
+          const { hostname, protocol } = new URL(item.url);
+
+          // 1. Protocol validation
+          if (!['http:', 'https:'].includes(protocol)) {
+            return `"${item.label}" uses unsupported protocol`;
+          }
+
+          // 2. SSRF protection via DNS lookup
+          const { address } = await dns.lookup(hostname);
+
+          const ipv4MappedMatch = address.match(
+            /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i,
+          );
+          if (ipv4MappedMatch) {
+            const mappedIp = ipv4MappedMatch[1];
+            const mappedParts = mappedIp.split('.').map(Number);
+            const isMappedPrivate =
+              mappedIp.startsWith('127.') ||
+              mappedIp.startsWith('10.') ||
+              mappedIp.startsWith('192.168.') ||
+              mappedIp.startsWith('169.254.') ||
+              (mappedParts[0] === 172 &&
+                mappedParts[1] >= 16 &&
+                mappedParts[1] <= 31);
+            if (isMappedPrivate) {
+              return `"${item.label}" points to a private network`;
+            }
+          }
+
+          const ipParts = address.split('.').map(Number);
+
+          const isPrivateIpv6 =
+            address === '::1' ||
+            /^fe80:/i.test(address) ||
+            /^fc[0-9a-f]{2}:/i.test(address) ||
+            /^fd[0-9a-f]{2}:/i.test(address);
+
+          const isPrivate =
+            isPrivateIpv6 ||
+            address.startsWith('127.') ||
+            address.startsWith('10.') ||
+            address.startsWith('192.168.') ||
+            address.startsWith('169.254.') ||
+            (ipParts[0] === 172 && ipParts[1] >= 16 && ipParts[1] <= 31);
+
+          if (isPrivate) {
+            return `"${item.label}" points to a private network`;
+          }
+
+          return null;
+        } catch {
+          return `"${item.label}" has an invalid URL`;
+        }
+      }),
+    );
+
+    const failures = results.filter(Boolean) as string[];
+
+    if (failures.length > 0) {
+      throw new UnprocessableEntityException({
+        error: 'INVALID_LINKS',
+        message:
+          'One or more links could not be verified. Please check the URLs and try again.',
+        failures,
+      });
+    }
   }
 
   async upsertDraft(
@@ -562,6 +790,11 @@ export class ProfileService {
       );
     }
 
+    // Validate visible link items before saving
+    if (dto.content?.links?.items?.length) {
+      await this.validateLinkItems(dto.content.links.items);
+    }
+
     const saved = await this.dataSource.transaction(async (manager) => {
       const draftRepo = manager.getRepository(ProfileDraft);
       await manager
@@ -570,6 +803,7 @@ export class ProfileService {
         .where('p.id = :profileId', { profileId: profile.id })
         .setLock('pessimistic_write')
         .getOneOrFail();
+
       // Lock the existing draft row if it exists — prevents concurrent writes
       const existingDrafts = await draftRepo
         .createQueryBuilder('d')
@@ -651,6 +885,90 @@ export class ProfileService {
       hasDraft: true,
       draftId: draft.id,
       updatedAt: draft.updatedAt,
+    };
+  }
+
+  async updateAppearance(
+    userId: string,
+    dto: AppearanceSettingsDto,
+  ): Promise<{ status: string; appearance: AppearanceSettingsDto }> {
+    const profile = await this.profileRepo.findOne({
+      where: { userId, deletedAt: IsNull() },
+    });
+    if (!profile) {
+      throw new NotFoundException(
+        'Profile not found. Please complete onboarding first.',
+      );
+    }
+
+    const existing = profile.appearance ?? {};
+    profile.appearance = {
+      ...existing,
+      ...(dto.template !== undefined && { template: dto.template }),
+      ...(dto.accentColour !== undefined && {
+        accentColour: dto.accentColour,
+      }),
+      ...(dto.backgroundColour !== undefined && {
+        backgroundColour: dto.backgroundColour,
+      }),
+      ...(dto.textColour !== undefined && {
+        textColour: dto.textColour,
+      }),
+      ...(dto.font !== undefined && { font: dto.font }),
+      ...(dto.cornerStyle !== undefined && { cornerStyle: dto.cornerStyle }),
+      ...(dto.spacing !== undefined && { spacing: dto.spacing }),
+      ...(dto.theme !== undefined && { theme: dto.theme }),
+    };
+
+    profile.hasUnpublishedChanges = true;
+
+    const saved = await this.profileRepo.save(profile);
+
+    await this.invalidateCache(saved.username);
+
+    return {
+      status: 'success',
+      appearance: dto,
+    };
+  }
+
+  async getAppearance(userId: string): Promise<{
+    status: string;
+    appearance: AppearanceSettingsDto;
+  }> {
+    const profile = await this.profileRepo.findOne({
+      where: {
+        userId,
+        deletedAt: IsNull(),
+      },
+    });
+
+    if (!profile) {
+      throw new NotFoundException(
+        'Profile not found. Please complete onboarding first.',
+      );
+    }
+
+    const VALID_FONTS = new Set([
+      'afacad',
+      'inter',
+      'serif',
+      'mono',
+      'geologica',
+      'manrope',
+    ]);
+
+    const appearance: AppearanceSettingsDto = {
+      ...DEFAULT_APPEARANCE,
+      ...(profile.appearance ?? {}),
+    };
+    if (!appearance.font || !VALID_FONTS.has(appearance.font)) {
+      appearance.font = DEFAULT_APPEARANCE.font;
+    }
+
+    return {
+      status: 'success',
+      appearance,
     };
   }
 }

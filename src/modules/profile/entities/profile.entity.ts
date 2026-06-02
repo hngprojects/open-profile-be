@@ -14,6 +14,7 @@ import { User } from '../../users/entities/user.entity';
 import { ProfileComponent } from './profile-component.entity';
 import { ProfileContentDto } from '../dto/profile-content.dto';
 import { ThemeSettings } from '../dto/theme-settings.dto';
+import { AppearanceSettingsDto } from '../dto/appearance-settings.dto';
 
 @Entity('profiles')
 export class Profile {
@@ -37,6 +38,15 @@ export class Profile {
   @Column({ nullable: true, type: 'text' })
   bio: string | null;
 
+  @Column({
+    type: 'text',
+    array: true,
+    name: 'skills',
+    nullable: false,
+    default: [],
+  })
+  skills: string[];
+
   @Column({ type: 'varchar', name: 'photo_url', nullable: true })
   photoUrl: string | null;
 
@@ -53,6 +63,9 @@ export class Profile {
     nullable: true,
   })
   content: ProfileContentDto | null;
+
+  @Column({ type: 'jsonb', nullable: true })
+  appearance: AppearanceSettingsDto | null;
 
   @Column({ type: 'varchar', name: 'cta_label', nullable: true })
   ctaLabel: string | null;

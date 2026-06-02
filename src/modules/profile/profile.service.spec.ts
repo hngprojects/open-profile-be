@@ -2,6 +2,13 @@ jest.mock('../../config/env', () => ({
   env: {},
 }));
 
+jest.mock('node:dns/promises', () => ({
+  __esModule: true,
+  default: {
+    lookup: jest.fn(),
+  },
+}));
+
 import { Test, TestingModule } from '@nestjs/testing';
 import {
   ConflictException,
@@ -11,6 +18,7 @@ import {
 } from '@nestjs/common';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { DataSource, IsNull } from 'typeorm';
+import dns from 'node:dns/promises';
 import { ProfileService } from './profile.service';
 import { Profile } from './entities/profile.entity';
 import { ProfileComponent } from './entities/profile-component.entity';
@@ -20,6 +28,11 @@ import { RedisService } from '../../common/redis/redis.service';
 import { UsernamesService } from '../usernames/usernames.service';
 import { ComponentSetMismatchException } from './exceptions/component-set-mismatch.exception';
 import type { AuthenticatedUser } from '../../common/decorators/current-user.decorator';
+import type { LinkItemDto } from './dto/profile-content.dto';
+import { SectionType } from './dto/profile-content.dto';
+import { CtaType } from './dto/profile-content.dto';
+
+const mockDnsLookup = dns.lookup as jest.Mock;
 
 const USER_ID = '550e8400-e29b-41d4-a716-446655440000';
 const PROFILE_ID = '660e8400-e29b-41d4-a716-446655440001';
@@ -82,6 +95,32 @@ const mockDraft = {
   updatedAt: NOW,
   deletedAt: null,
 } as ProfileDraft;
+
+const mockLinkItem: LinkItemDto = {
+  id: 'link-001',
+  label: 'My GitHub',
+  url: 'https://github.com/username',
+  platform: 'github',
+  visible: true,
+};
+
+const mockDraftContent = {
+  sectionOrder: [
+    SectionType.BIO,
+    SectionType.LINKS,
+    SectionType.PROJECTS,
+    SectionType.CTA,
+  ],
+  bio: { visible: true, content: '' },
+  links: { visible: true, sectionTitle: 'Links', items: [mockLinkItem] },
+  projects: { visible: true, sectionTitle: 'Projects', items: [] },
+  cta: {
+    visible: true,
+    type: CtaType.LINK,
+    label: 'Contact Me',
+    value: 'https://example.com',
+  },
+};
 
 // Helper to build a chainable query-builder mock
 function mockQueryBuilder<T>(getManyResolve: T, getOneOrFailResolve?: unknown) {
@@ -204,6 +243,7 @@ describe('ProfileService', () => {
 
     service = module.get<ProfileService>(ProfileService);
     jest.clearAllMocks();
+    mockDnsLookup.mockResolvedValue({ address: '140.82.114.4' });
   });
 
   // ---------------------------------------------------------------------------
@@ -223,7 +263,6 @@ describe('ProfileService', () => {
         available: true,
         normalizedUsername: USERNAME,
       });
-      userRepo.findOne.mockResolvedValue({ fullName: 'Test User' });
 
       const createdProfile = { ...mockProfile };
       profileRepo.create.mockReturnValue(createdProfile);
@@ -240,10 +279,7 @@ describe('ProfileService', () => {
         where: { userId: USER_ID },
       });
       expect(usernamesService.check).toHaveBeenCalledWith(USERNAME);
-      expect(userRepo.findOne).toHaveBeenCalledWith({
-        where: { id: USER_ID },
-        select: ['fullName'],
-      });
+      expect(userRepo.findOne).not.toHaveBeenCalled();
       expect(profileRepo.create).toHaveBeenCalledWith({
         userId: USER_ID,
         username: USERNAME,
@@ -295,26 +331,12 @@ describe('ProfileService', () => {
       );
     });
 
-    it('throws NotFoundException when user record is missing', async () => {
-      profileRepo.findOne.mockResolvedValue(null);
-      usernamesService.check.mockResolvedValue({
-        available: true,
-        normalizedUsername: USERNAME,
-      });
-      userRepo.findOne.mockResolvedValue(null);
-
-      await expect(service.createProfile(createDto, mockUser)).rejects.toThrow(
-        NotFoundException,
-      );
-    });
-
     it('throws NotFoundException when user update inside transaction fails', async () => {
       profileRepo.findOne.mockResolvedValue(null);
       usernamesService.check.mockResolvedValue({
         available: true,
         normalizedUsername: USERNAME,
       });
-      userRepo.findOne.mockResolvedValue({ fullName: 'Test User' });
 
       const createdProfile = { ...mockProfile, id: undefined };
       profileRepo.create.mockReturnValue(createdProfile);
@@ -333,6 +355,35 @@ describe('ProfileService', () => {
   // ---------------------------------------------------------------------------
   // getPublicProfile
   // ---------------------------------------------------------------------------
+  describe('validateLink', () => {
+    it('sanitizes a valid URL and returns encoded backend URL', () => {
+      const result = service.validateLink('  example.com  ');
+
+      expect(result.original).toBe('  example.com  ');
+      expect(result.sanitized).toBe('example.com');
+      expect(result.encoded).toBe('https://example.com');
+    });
+
+    it('encodes supported social handles when iconId is provided', () => {
+      const result = service.validateLink('@username', 'github');
+
+      expect(result.sanitized).toBe('@username');
+      expect(result.encoded).toBe('https://github.com/username');
+    });
+
+    it('throws UnprocessableEntityException for dangerous URLs', () => {
+      expect(() => service.validateLink('javascript:alert(1)')).toThrow(
+        UnprocessableEntityException,
+      );
+    });
+
+    it('throws UnprocessableEntityException for invalid URL format', () => {
+      expect(() => service.validateLink('not-a-valid-url')).toThrow(
+        UnprocessableEntityException,
+      );
+    });
+  });
+
   describe('getPublicProfile', () => {
     it('returns cached profile with etag and fromCache true', async () => {
       const cachedData: Record<string, unknown> = {
@@ -379,8 +430,8 @@ describe('ProfileService', () => {
         },
         relations: ['user'],
       });
-      expect(redisService.set).toHaveBeenCalledTimes(2); // lock + cache
-      expect(redisService.del).toHaveBeenCalled(); // lock cleanup
+      expect(redisService.set).toHaveBeenCalledTimes(2);
+      expect(redisService.del).toHaveBeenCalled();
       expect(result.data.username).toBe(USERNAME);
       expect(result.fromCache).toBe(false);
       expect(result.etag).toBeTruthy();
@@ -404,7 +455,7 @@ describe('ProfileService', () => {
 
     it('does not release lock it did not acquire', async () => {
       redisService.get.mockResolvedValue(null);
-      redisService.set.mockResolvedValue(false); // lock not acquired
+      redisService.set.mockResolvedValue(false);
       profileRepo.findOne.mockResolvedValue({
         ...mockProfile,
         user: { id: USER_ID },
@@ -417,30 +468,111 @@ describe('ProfileService', () => {
   });
 
   // ---------------------------------------------------------------------------
+  // getAppearance
+  // ---------------------------------------------------------------------------
+  describe('getAppearance', () => {
+    const defaultAppearance = {
+      template: 'professional',
+      accentColour: '#0EA5E9',
+      backgroundColour: '#ffffff',
+      textColour: '#111827',
+      font: 'inter',
+      cornerStyle: 'rounded',
+      spacing: 20,
+      theme: 'light',
+    };
+
+    it('returns saved appearance when profile has appearance', async () => {
+      profileRepo.findOne.mockResolvedValue({
+        ...mockProfile,
+        appearance: {
+          template: 'creator',
+          accentColour: '#6366f1',
+          backgroundColour: '#ffffff',
+          textColour: '#111827',
+          font: 'serif',
+          cornerStyle: 'pill',
+          spacing: 16,
+          theme: 'dark',
+        },
+      });
+
+      const result = await service.getAppearance(USER_ID);
+
+      expect(profileRepo.findOne).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            userId: USER_ID,
+            deletedAt: IsNull(),
+          }),
+        }),
+      );
+
+      expect(result.status).toBe('success');
+      expect(result.appearance).toEqual({
+        template: 'creator',
+        accentColour: '#6366f1',
+        backgroundColour: '#ffffff',
+        textColour: '#111827',
+        font: 'serif',
+        cornerStyle: 'pill',
+        spacing: 16,
+        theme: 'dark',
+      });
+    });
+
+    it('returns default appearance when none exists', async () => {
+      profileRepo.findOne.mockResolvedValue({
+        ...mockProfile,
+        appearance: null,
+      });
+
+      const result = await service.getAppearance(USER_ID);
+
+      expect(result.appearance).toEqual(defaultAppearance);
+    });
+
+    it('returns default appearance when appearance is undefined', async () => {
+      profileRepo.findOne.mockResolvedValue(mockProfile);
+
+      const result = await service.getAppearance(USER_ID);
+
+      expect(result.appearance).toEqual(defaultAppearance);
+    });
+
+    it('throws NotFoundException when profile does not exist', async () => {
+      profileRepo.findOne.mockResolvedValue(null);
+
+      await expect(service.getAppearance(USER_ID)).rejects.toThrow(
+        NotFoundException,
+      );
+    });
+  });
+  // ---------------------------------------------------------------------------
   // getDashboardProfile
   // ---------------------------------------------------------------------------
   describe('getDashboardProfile', () => {
-    it('returns profile with ordered components', async () => {
-      profileRepo.findOne.mockResolvedValue(mockProfile);
-      const components = [
-        { ...mockComponent, displayOrder: 0, sectionType: 'bio' },
-        {
-          ...mockComponent,
-          id: 'comp-2',
-          displayOrder: 1,
-          sectionType: 'links',
-          title: 'Links',
-          content: null,
-        },
-      ];
-      componentRepo.find.mockResolvedValue(components);
+    it('returns default content when neither draft nor published content exist', async () => {
+      profileRepo.findOne.mockResolvedValue({
+        ...mockProfile,
+        content: null,
+        bio: null,
+        ctaLabel: null,
+        ctaUrl: null,
+      });
+      draftRepo.findOne.mockResolvedValue(null);
 
-      const result = await service.getDashboardProfile(USER_ID);
+      const result = await service.getProfileContent(USER_ID);
 
-      expect(result.id).toBe(PROFILE_ID);
-      expect(result.components).toHaveLength(2);
-      expect(result.components[0].sectionType).toBe('bio');
-      expect(result.components[1].displayOrder).toBe(1);
+      expect(result.source).toBe('published');
+      expect(result.content).toBeDefined();
+
+      // safer: avoids coupling test to enum string values
+      expect(result.content!.sectionOrder).toHaveLength(4);
+      expect(result.content!.bio.visible).toBe(true);
+      expect(result.content!.links.visible).toBe(true);
+      expect(result.content!.projects.visible).toBe(true);
+      expect(result.content!.cta.visible).toBe(true);
     });
 
     it('throws NotFoundException when profile does not exist', async () => {
@@ -513,7 +645,6 @@ describe('ProfileService', () => {
   // ---------------------------------------------------------------------------
   describe('reorderComponents', () => {
     const componentIds = [COMPONENT_ID];
-
     const currentComponents = [{ ...mockComponent, displayOrder: 0 }];
 
     it('reorders components and invalidates cache', async () => {
@@ -546,7 +677,7 @@ describe('ProfileService', () => {
       profileRepo.findOne.mockResolvedValue(mockProfile);
 
       const txComponentRepo = txManager.getRepository(ProfileComponent);
-      const qb = mockQueryBuilder([]); // no current components
+      const qb = mockQueryBuilder([]);
       txComponentRepo.createQueryBuilder.mockReturnValue(qb);
       txComponentRepo.find.mockResolvedValue([
         { id: COMPONENT_ID },
@@ -666,6 +797,42 @@ describe('ProfileService', () => {
         NotFoundException,
       );
     });
+
+    it('throws UnprocessableEntityException when a visible link cannot be resolved on publish', async () => {
+      profileRepo.findOne.mockResolvedValue(mockProfile);
+
+      mockDnsLookup.mockRejectedValue(new Error('Domain not found'));
+
+      const txDraftRepo = txManager.getRepository(ProfileDraft);
+      txDraftRepo.findOne.mockResolvedValue({
+        ...mockDraft,
+        content: mockDraftContent,
+      });
+
+      await expect(service.publishProfile(USER_ID)).rejects.toThrow(
+        UnprocessableEntityException,
+      );
+      expect(mockDnsLookup).toHaveBeenCalledWith('github.com');
+    });
+
+    it('publishes successfully when all visible links resolve to public addresses', async () => {
+      profileRepo.findOne.mockResolvedValue(mockProfile);
+
+      const txDraftRepo = txManager.getRepository(ProfileDraft);
+      txDraftRepo.findOne.mockResolvedValue({
+        ...mockDraft,
+        content: mockDraftContent,
+      });
+
+      const txProfileRepo = txManager.getRepository(Profile);
+      txProfileRepo.create.mockReturnValue({ ...mockProfile });
+      txProfileRepo.save.mockResolvedValue({ ...mockProfile });
+
+      const result = await service.publishProfile(USER_ID);
+
+      expect(result.status).toBe('success');
+      expect(mockDnsLookup).toHaveBeenCalledWith('github.com');
+    });
   });
 
   // ---------------------------------------------------------------------------
@@ -732,12 +899,12 @@ describe('ProfileService', () => {
       profileRepo.findOne.mockResolvedValue(mockProfile);
 
       const txProfileRepo = txManager.getRepository(Profile);
-      const qb = mockQueryBuilder(undefined, undefined);
-      txProfileRepo.createQueryBuilder.mockReturnValue(qb);
+      txProfileRepo.createQueryBuilder.mockReturnValue(
+        mockQueryBuilder(undefined, undefined),
+      );
 
       const txDraftRepo = txManager.getRepository(ProfileDraft);
-      const draftQb = mockQueryBuilder([]);
-      txDraftRepo.createQueryBuilder.mockReturnValue(draftQb);
+      txDraftRepo.createQueryBuilder.mockReturnValue(mockQueryBuilder([]));
       const draftFromDto = { ...mockDraft, bio: upsertDto.bio };
       txDraftRepo.create.mockReturnValue(draftFromDto);
       txDraftRepo.save.mockResolvedValue(draftFromDto);
@@ -752,13 +919,15 @@ describe('ProfileService', () => {
       profileRepo.findOne.mockResolvedValue(mockProfile);
 
       const txProfileRepo = txManager.getRepository(Profile);
-      const qb = mockQueryBuilder(undefined, undefined);
-      txProfileRepo.createQueryBuilder.mockReturnValue(qb);
+      txProfileRepo.createQueryBuilder.mockReturnValue(
+        mockQueryBuilder(undefined, undefined),
+      );
 
       const txDraftRepo = txManager.getRepository(ProfileDraft);
       const existingDraft = { ...mockDraft, updatedAt: NOW };
-      const draftQb = mockQueryBuilder([existingDraft]);
-      txDraftRepo.createQueryBuilder.mockReturnValue(draftQb);
+      txDraftRepo.createQueryBuilder.mockReturnValue(
+        mockQueryBuilder([existingDraft]),
+      );
       txDraftRepo.create.mockReturnValue(existingDraft);
       txDraftRepo.save.mockResolvedValue(existingDraft);
 
@@ -775,16 +944,18 @@ describe('ProfileService', () => {
       profileRepo.findOne.mockResolvedValue(mockProfile);
 
       const txProfileRepo = txManager.getRepository(Profile);
-      const qb = mockQueryBuilder(undefined, undefined);
-      txProfileRepo.createQueryBuilder.mockReturnValue(qb);
+      txProfileRepo.createQueryBuilder.mockReturnValue(
+        mockQueryBuilder(undefined, undefined),
+      );
 
       const txDraftRepo = txManager.getRepository(ProfileDraft);
       const staleDraft = {
         ...mockDraft,
         updatedAt: new Date(NOW.getTime() - 10000),
       };
-      const draftQb = mockQueryBuilder([staleDraft]);
-      txDraftRepo.createQueryBuilder.mockReturnValue(draftQb);
+      txDraftRepo.createQueryBuilder.mockReturnValue(
+        mockQueryBuilder([staleDraft]),
+      );
 
       await expect(
         service.upsertDraft(USER_ID, upsertDto, 'different-version'),
@@ -797,6 +968,87 @@ describe('ProfileService', () => {
       await expect(service.upsertDraft(USER_ID, upsertDto)).rejects.toThrow(
         NotFoundException,
       );
+    });
+
+    it('validates visible link items before saving draft', async () => {
+      profileRepo.findOne.mockResolvedValue(mockProfile);
+
+      const txProfileRepo = txManager.getRepository(Profile);
+      txProfileRepo.createQueryBuilder.mockReturnValue(
+        mockQueryBuilder(undefined, undefined),
+      );
+
+      const txDraftRepo = txManager.getRepository(ProfileDraft);
+      txDraftRepo.createQueryBuilder.mockReturnValue(mockQueryBuilder([]));
+      txDraftRepo.create.mockReturnValue(mockDraft);
+      txDraftRepo.save.mockResolvedValue(mockDraft);
+
+      await expect(
+        service.upsertDraft(USER_ID, { content: mockDraftContent }),
+      ).resolves.not.toThrow();
+
+      expect(mockDnsLookup).toHaveBeenCalledWith('github.com');
+    });
+
+    it('throws UnprocessableEntityException when a visible link cannot be resolved in upsertDraft', async () => {
+      profileRepo.findOne.mockResolvedValue(mockProfile);
+
+      mockDnsLookup.mockRejectedValue(new Error('Domain not found'));
+
+      await expect(
+        service.upsertDraft(USER_ID, { content: mockDraftContent }),
+      ).rejects.toThrow(UnprocessableEntityException);
+      expect(mockDnsLookup).toHaveBeenCalledWith('github.com');
+    });
+
+    it('skips validation for hidden link items in upsertDraft', async () => {
+      profileRepo.findOne.mockResolvedValue(mockProfile);
+
+      const txProfileRepo = txManager.getRepository(Profile);
+      txProfileRepo.createQueryBuilder.mockReturnValue(
+        mockQueryBuilder(undefined, undefined),
+      );
+
+      const txDraftRepo = txManager.getRepository(ProfileDraft);
+      txDraftRepo.createQueryBuilder.mockReturnValue(mockQueryBuilder([]));
+      txDraftRepo.create.mockReturnValue(mockDraft);
+      txDraftRepo.save.mockResolvedValue(mockDraft);
+
+      await expect(
+        service.upsertDraft(USER_ID, {
+          content: {
+            ...mockDraftContent,
+            links: {
+              visible: true,
+              sectionTitle: 'Links',
+              items: [{ ...mockLinkItem, visible: false }],
+            },
+          },
+        }),
+      ).resolves.not.toThrow();
+
+      expect(mockDnsLookup).not.toHaveBeenCalled();
+    });
+
+    it('throws UnprocessableEntityException for SSRF url in upsertDraft', async () => {
+      profileRepo.findOne.mockResolvedValue(mockProfile);
+
+      mockDnsLookup.mockResolvedValue({ address: '127.0.0.1' });
+
+      await expect(
+        service.upsertDraft(USER_ID, {
+          content: {
+            ...mockDraftContent,
+            links: {
+              visible: true,
+              sectionTitle: 'Links',
+              items: [{ ...mockLinkItem, url: 'http://localhost:5432' }],
+            },
+          },
+        }),
+      ).rejects.toThrow(UnprocessableEntityException);
+
+      expect(mockDnsLookup).toHaveBeenCalledWith('localhost');
     });
   });
 
@@ -828,6 +1080,88 @@ describe('ProfileService', () => {
 
       await expect(service.getDraftState(USER_ID)).rejects.toThrow(
         NotFoundException,
+      );
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // updateAppearance
+  // ---------------------------------------------------------------------------
+  describe('updateAppearance', () => {
+    const appearanceDto = {
+      template: 'professional' as const,
+      accentColour: '#6366f1',
+      backgroundColour: '#ffffff',
+      textColour: '#111827',
+      font: 'inter' as const,
+      cornerStyle: 'rounded' as const,
+      spacing: 16,
+      theme: 'dark' as const,
+    };
+
+    it('saves appearance, sets hasUnpublishedChanges, and invalidates cache', async () => {
+      profileRepo.findOne.mockResolvedValue(mockProfile);
+      profileRepo.save.mockResolvedValue({
+        ...mockProfile,
+        appearance: appearanceDto,
+        hasUnpublishedChanges: true,
+      });
+
+      const result = await service.updateAppearance(USER_ID, appearanceDto);
+
+      expect(result.status).toBe('success');
+      expect(result.appearance).toEqual(appearanceDto);
+      expect(profileRepo.save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          appearance: appearanceDto,
+          hasUnpublishedChanges: true,
+        }),
+      );
+      expect(redisService.del).toHaveBeenCalledWith(`profile:${USERNAME}`);
+    });
+
+    it('throws NotFoundException when profile does not exist', async () => {
+      profileRepo.findOne.mockResolvedValue(null);
+
+      await expect(
+        service.updateAppearance(USER_ID, appearanceDto),
+      ).rejects.toThrow(NotFoundException);
+    });
+
+    it('merges partial payload with existing appearance fields', async () => {
+      const existingAppearance = {
+        template: 'portfolio' as const,
+        accentColour: '#ff0000',
+        backgroundColour: '#000000',
+        textColour: '#111827',
+        font: 'serif' as const,
+        cornerStyle: 'sharp' as const,
+        spacing: 8,
+        theme: 'light' as const,
+      };
+
+      profileRepo.findOne.mockResolvedValue({
+        ...mockProfile,
+        appearance: existingAppearance,
+      });
+      profileRepo.save.mockImplementation((p: Profile) => Promise.resolve(p));
+
+      const partial = { theme: 'dark' as const };
+      await service.updateAppearance(USER_ID, partial);
+
+      expect(profileRepo.save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          appearance: expect.objectContaining({
+            template: 'portfolio',
+            accentColour: '#ff0000',
+            backgroundColour: '#000000',
+            textColour: '#111827',
+            font: 'serif',
+            cornerStyle: 'sharp',
+            spacing: 8,
+            theme: 'dark',
+          }),
+        }),
       );
     });
   });

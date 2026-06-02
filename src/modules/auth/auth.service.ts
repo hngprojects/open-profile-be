@@ -60,7 +60,7 @@ const BRUTE_LOCKOUT_SECONDS = 30 * 60;
 const IP_RATE_LIMIT_MAX = 10;
 const IP_RATE_LIMIT_WINDOW_SECONDS = 15 * 60;
 
-export interface GoogleAuthResponse extends AuthTokens {
+export interface GoogleAuthResponse {
   user: Omit<User, 'password' | 'refreshTokenHash' | 'deletedAt'>;
   isNewUser: boolean;
 }
@@ -83,9 +83,7 @@ export class AuthService {
     const user = await this.usersService.createEmailUser({
       email: dto.email,
       password: dto.password,
-      fullName: dto.fullName,
     });
-
     const otp = this.generateOtp();
     const otpHash = await argon2.hash(otp);
     const otpExpiresAt = new Date(Date.now() + OTP_TTL_MS);
@@ -96,7 +94,7 @@ export class AuthService {
       await this.queueService.addJob(
         QUEUE_NAMES.EMAIL,
         QUEUE_JOB_NAMES.EMAIL.SEND_OTP,
-        { to: user.email, otp, fullName: user.fullName },
+        { to: user.email, otp, fullName: user.fullName ?? '' },
       );
     } catch (err) {
       await this.usersService.clearOtpOnly(user.id);
@@ -186,7 +184,7 @@ export class AuthService {
         await this.queueService.addJob(
           QUEUE_NAMES.EMAIL,
           QUEUE_JOB_NAMES.EMAIL.SEND_OTP,
-          { to: user.email, otp, fullName: user.fullName },
+          { to: user.email, otp, fullName: user.fullName ?? '' },
         );
       } catch (err) {
         await this.usersService.clearOtpOnly(user.id);
@@ -570,18 +568,18 @@ export class AuthService {
     user: User,
     ipAddress: string,
     _req: Request,
+    res: Response,
   ): Promise<GoogleAuthResponse> {
     this.usersService.logOAuthLogin(user.id, ipAddress, 'google');
 
     const accessToken = await this.tokenService.generateAccessToken(user);
     const refreshToken = await this.tokenService.generateRefreshToken(user.id);
+    this.tokenService.setTokenCookies(res, { accessToken, refreshToken });
 
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     const { password, deletedAt, ...safeUser } = user;
 
     return {
-      accessToken,
-      refreshToken,
       user: safeUser,
       isNewUser: !user.onboardingComplete,
     };
@@ -684,7 +682,7 @@ export class AuthService {
     await this.queueService.addJob(
       QUEUE_NAMES.EMAIL,
       QUEUE_JOB_NAMES.EMAIL.SEND_OTP,
-      { to: user.email, otp, fullName: user.fullName },
+      { to: user.email, otp, fullName: user.fullName ?? '' },
     );
 
     return { message: 'OTP has been sent successfully' };

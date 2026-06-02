@@ -9,6 +9,7 @@ import {
   MaxLength,
   MinLength,
 } from 'class-validator';
+import { Transform } from 'class-transformer';
 
 export class CreateProfileDto {
   @ApiProperty({
@@ -27,13 +28,20 @@ export class CreateProfileDto {
   username: string;
 
   @ApiProperty({
-    description: 'Display name for the profile',
-    example: 'John Doe',
-    maxLength: 100,
+    description: 'Full name of the user',
+    example: 'Jane Doe',
+    minLength: 1,
+    maxLength: 255,
   })
-  @IsNotEmpty()
-  @IsString()
-  @MaxLength(100)
+  @IsNotEmpty({ message: 'Full name is required.' })
+  @IsString({ message: 'Full name must be a string.' })
+  @MinLength(1, { message: 'Full name is required.' })
+  @MaxLength(255, {
+    message: 'Full name must not be more than 255 characters.',
+  })
+  @Transform(({ value }: { value: unknown }) =>
+    typeof value === 'string' ? value.trim() : value,
+  )
   fullName: string;
 
   @ApiProperty({
